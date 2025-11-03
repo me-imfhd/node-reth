@@ -6,7 +6,7 @@ use alloy_consensus::transaction::{Recovered, SignerRecoverable, TransactionMeta
 use alloy_consensus::{Header, TxReceipt};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::map::foldhash::HashMap;
-use alloy_primitives::{Address, BlockNumber, Bytes, Sealable, B256, U256};
+use alloy_primitives::{Address, BlockNumber, Bytes, FixedBytes, Sealable, B256, U256};
 use alloy_rpc_types::{TransactionTrait, Withdrawal};
 use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3};
 use alloy_rpc_types_eth::state::StateOverride;
@@ -415,7 +415,7 @@ where
             .build();
         let mut pending_blocks_builder = PendingBlocksBuilder::new();
 
-        let mut db = match &prev_pending_blocks {
+        let db = match &prev_pending_blocks {
             Some(pending_blocks) => CacheDB {
                 cache: pending_blocks.get_db_cache(),
                 db: state,
@@ -426,6 +426,19 @@ where
             Some(pending_blocks) => pending_blocks.get_state_overrides().unwrap_or_default(),
             None => StateOverride::default(),
         };
+
+        let evm_env = evm_config.next_evm_env(
+            &last_block_header,
+            &OpNextBlockEnvAttributes {
+                extra_data: Bytes::new(),
+                gas_limit: 0,
+                parent_beacon_block_root: None,
+                prev_randao: FixedBytes([0u8; 32]),
+                suggested_fee_recipient: Address(FixedBytes([0u8; 20])),
+                timestamp: 0,
+            },
+        )?;
+        let mut evm = evm_config.evm_with_env(db, evm_env);
 
         for (_block_number, block_flashblocks) in flashblocks_per_block {
             let base = block_flashblocks
@@ -504,8 +517,9 @@ where
                 extra_data: base.extra_data.clone(),
             };
 
-            let evm_env = evm_config.next_evm_env(&last_block_header, &block_env_attributes)?;
-            let mut evm = evm_config.evm_with_env(db, evm_env);
+            let new_config = evm_config.next_evm_env(&last_block_header, &block_env_attributes)?;
+            evm.modify_block(|block| *block = new_config.block_env);
+            evm.modify_cfg(|cfg| *cfg = new_config.cfg_env);
 
             let mut gas_used = 0;
             let mut next_log_index = 0;
@@ -657,11 +671,10 @@ where
                 pending_blocks_builder.with_account_balance(address, balance);
             }
 
-            db = evm.into_db();
             last_block_header = block.header.clone();
         }
 
-        pending_blocks_builder.with_db_cache(db.cache);
+        pending_blocks_builder.with_db_cache(evm.into_db().cache);
         pending_blocks_builder.with_state_overrides(state_overrides);
         Ok(Some(Arc::new(pending_blocks_builder.build()?)))
     }
