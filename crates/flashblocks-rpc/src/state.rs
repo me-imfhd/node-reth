@@ -105,16 +105,18 @@ where
 
 impl<Client> FlashblocksReceiver for FlashblocksState<Client> {
     fn on_flashblock_received(&self, flashblock: Flashblock) {
-        match self.queue.send(StateUpdate::Flashblock(flashblock.clone())) {
+        let block_number = flashblock.metadata.block_number;
+        let index = flashblock.index;
+        match self.queue.send(StateUpdate::Flashblock(flashblock)) {
             Ok(_) => {
                 info!(
                     message = "added flashblock to processing queue",
-                    block_number = flashblock.metadata.block_number,
-                    flashblock_index = flashblock.index
+                    block_number = block_number,
+                    flashblock_index = index
                 );
             }
             Err(e) => {
-                error!(message = "could not add flashblock to processing queue", block_number = flashblock.metadata.block_number, flashblock_index = flashblock.index, error = %e);
+                error!(message = "could not add flashblock to processing queue", block_number = block_number, flashblock_index = index, error = %e);
             }
         }
     }
@@ -151,7 +153,9 @@ impl PendingBlocksAPI for Guard<Option<Arc<PendingBlocks>>> {
         &self,
         tx_hash: alloy_primitives::TxHash,
     ) -> Option<RpcReceipt<Optimism>> {
-        self.as_ref().and_then(|pb| pb.get_receipt(tx_hash))
+        self.as_ref()
+            .and_then(|pb| pb.get_receipt(tx_hash))
+            .map(|receipt| (*receipt).clone())
     }
 
     fn get_transaction_by_hash(
@@ -160,6 +164,7 @@ impl PendingBlocksAPI for Guard<Option<Arc<PendingBlocks>>> {
     ) -> Option<RpcTransaction<Optimism>> {
         self.as_ref()
             .and_then(|pb| pb.get_transaction_by_hash(tx_hash))
+            .map(|t| (*t).clone())
     }
 
     fn get_balance(&self, address: Address) -> Option<U256> {
@@ -213,14 +218,13 @@ where
 
     async fn start(&self) {
         while let Some(update) = self.rx.lock().await.recv().await {
-            let prev_pending_blocks = self.pending_blocks.load_full();
             match update {
                 StateUpdate::Canonical(block) => {
                     debug!(
                         message = "processing canonical block",
                         block_number = block.number
                     );
-                    match self.process_canonical_block(prev_pending_blocks, &block) {
+                    match self.process_canonical_block(&block) {
                         Ok(new_pending_blocks) => {
                             self.pending_blocks.swap(new_pending_blocks);
                         }
@@ -236,7 +240,7 @@ where
                         block_number = flashblock.metadata.block_number,
                         flashblock_index = flashblock.index
                     );
-                    match self.process_flashblock(prev_pending_blocks, flashblock) {
+                    match self.process_flashblock(flashblock) {
                         Ok(new_pending_blocks) => {
                             if new_pending_blocks.is_some() {
                                 _ = self.sender.send(new_pending_blocks.clone().unwrap())
@@ -259,12 +263,12 @@ where
 
     fn process_canonical_block(
         &self,
-        prev_pending_blocks: Option<Arc<PendingBlocks>>,
         block: &RecoveredBlock<OpBlock>,
     ) -> eyre::Result<Option<Arc<PendingBlocks>>> {
+        let prev_pending_blocks = self.pending_blocks.load_full();
         match &prev_pending_blocks {
             Some(pending_blocks) => {
-                let mut flashblocks = pending_blocks.get_flashblocks();
+                let mut flashblocks = pending_blocks.flashblocks();
                 let num_flashblocks_for_canon = flashblocks
                     .iter()
                     .filter(|fb| fb.metadata.block_number == block.number)
@@ -285,9 +289,9 @@ where
                     Ok(None)
                 } else {
                     // If we had a reorg, we need to reset all flashblocks state
-                    let tracked_txns = pending_blocks.get_transactions_for_block(block.number);
+                    let tracked_txns = pending_blocks.transactions_for_block(block.number);
                     let tracked_txn_hashes: HashSet<_> =
-                        tracked_txns.iter().map(|tx| tx.tx_hash()).collect();
+                        tracked_txns.map(|tx| tx.tx_hash()).collect();
                     let block_txn_hashes: HashSet<_> =
                         block.body().transactions().map(|tx| tx.tx_hash()).collect();
 
@@ -309,11 +313,11 @@ where
                         self.metrics.pending_clear_reorg.increment(1);
 
                         // If there is a reorg, we re-process all future flashblocks without reusing the existing pending state
-                        return self.build_pending_state(None, &flashblocks);
+                        return self.build_pending_state(None, flashblocks);
                     }
 
                     // If no reorg, we can continue building on top of the existing pending state
-                    self.build_pending_state(prev_pending_blocks, &flashblocks)
+                    self.build_pending_state(prev_pending_blocks, flashblocks)
                 }
             }
             None => {
@@ -325,17 +329,17 @@ where
 
     fn process_flashblock(
         &self,
-        prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblock: Flashblock,
     ) -> eyre::Result<Option<Arc<PendingBlocks>>> {
+        let prev_pending_blocks = self.pending_blocks.load_full();
         match &prev_pending_blocks {
             Some(pending_blocks) => {
                 if self.is_next_flashblock(pending_blocks, &flashblock) {
                     // We have received the next flashblock for the current block
                     // or the first flashblock for the next block
-                    let mut flashblocks = pending_blocks.get_flashblocks();
-                    flashblocks.push(flashblock);
-                    self.build_pending_state(prev_pending_blocks, &flashblocks)
+                    let mut flashblocks = pending_blocks.flashblocks();
+                    flashblocks.push(Arc::new(flashblock));
+                    self.build_pending_state(prev_pending_blocks, flashblocks)
                 } else if pending_blocks.latest_block_number() != flashblock.metadata.block_number {
                     // We have received a non-zero flashblock for a new block
                     self.metrics.unexpected_block_order.increment(1);
@@ -369,7 +373,7 @@ where
             }
             None => {
                 if flashblock.index == 0 {
-                    self.build_pending_state(None, &vec![flashblock])
+                    self.build_pending_state(None, vec![Arc::new(flashblock)])
                 } else {
                     info!(message = "waiting for first Flashblock");
                     Ok(None)
@@ -381,10 +385,10 @@ where
     fn build_pending_state(
         &self,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
-        flashblocks: &Vec<Flashblock>,
+        flashblocks: Vec<Arc<Flashblock>>,
     ) -> eyre::Result<Option<Arc<PendingBlocks>>> {
         // BTreeMap guarantees ascending order of keys while iterating
-        let mut flashblocks_per_block = BTreeMap::<BlockNumber, Vec<&Flashblock>>::new();
+        let mut flashblocks_per_block = BTreeMap::<BlockNumber, Vec<Arc<Flashblock>>>::new();
         for flashblock in flashblocks {
             flashblocks_per_block
                 .entry(flashblock.metadata.block_number)
@@ -423,51 +427,44 @@ where
             None => StateOverride::default(),
         };
 
-        for (_block_number, flashblocks) in flashblocks_per_block {
-            let base = flashblocks
+        for (_block_number, block_flashblocks) in flashblocks_per_block {
+            let base = block_flashblocks
                 .first()
                 .ok_or(eyre!("cannot build a pending block from no flashblocks"))?
                 .base
                 .clone()
                 .ok_or(eyre!("first flashblock does not contain a base"))?;
 
-            let latest_flashblock = flashblocks
+            let latest_flashblock = block_flashblocks
                 .last()
                 .cloned()
                 .ok_or(eyre!("cannot build a pending block from no flashblocks"))?;
 
-            let transactions: Vec<Bytes> = flashblocks
+            let transactions: Vec<Bytes> = block_flashblocks
                 .iter()
                 .flat_map(|flashblock| flashblock.diff.transactions.clone())
                 .collect();
 
-            let withdrawals: Vec<Withdrawal> = flashblocks
+            let withdrawals: Vec<Withdrawal> = block_flashblocks
                 .iter()
                 .flat_map(|flashblock| flashblock.diff.withdrawals.clone())
                 .collect();
 
-            let receipt_by_hash = flashblocks
+            let receipt_by_hash = block_flashblocks
                 .iter()
-                .map(|flashblock| flashblock.metadata.receipts.clone())
+                .map(|flashblock| &flashblock.metadata.receipts)
                 .fold(HashMap::default(), |mut acc, receipts| {
                     acc.extend(receipts);
                     acc
                 });
 
-            let updated_balances = flashblocks
+            let updated_balances = block_flashblocks
                 .iter()
                 .map(|flashblock| flashblock.metadata.new_account_balances.clone())
                 .fold(HashMap::default(), |mut acc, balances| {
                     acc.extend(balances);
                     acc
                 });
-
-            pending_blocks_builder.with_flashblocks(
-                flashblocks
-                    .iter()
-                    .map(|&x| x.clone())
-                    .collect::<Vec<Flashblock>>(),
-            );
 
             let execution_payload: ExecutionPayloadV3 = ExecutionPayloadV3 {
                 blob_gas_used: 0,
@@ -568,7 +565,7 @@ where
                     deposit_receipt_version,
                 };
 
-                pending_blocks_builder.with_transaction(rpc_txn);
+                pending_blocks_builder.with_transaction(Arc::new(rpc_txn));
 
                 // Receipt Generation
                 let meta = TransactionMeta {
@@ -596,7 +593,7 @@ where
                 )?
                 .build();
 
-                pending_blocks_builder.with_receipt(transaction.tx_hash(), op_receipt);
+                pending_blocks_builder.with_receipt(transaction.tx_hash(), Arc::new(op_receipt));
                 gas_used = receipt.cumulative_gas_used();
                 next_log_index += receipt.logs().len();
 
@@ -653,6 +650,8 @@ where
                     }
                 }
             }
+
+            pending_blocks_builder.with_flashblocks(block_flashblocks.into_iter());
 
             for (address, balance) in updated_balances {
                 pending_blocks_builder.with_account_balance(address, balance);
