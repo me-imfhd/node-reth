@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use alloy_consensus::{Header, Sealed};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{
     map::foldhash::{HashMap, HashMapExt},
-    Address, BlockNumber, TxHash, B256, U256,
+    Address, BlockNumber, B256, U256,
 };
 use alloy_provider::network::TransactionResponse;
 use alloy_rpc_types::{state::StateOverride, BlockTransactions};
@@ -16,15 +18,18 @@ use reth_rpc_eth_api::RpcBlock;
 use crate::subscription::Flashblock;
 
 pub struct PendingBlocksBuilder {
-    flashblocks: Vec<Flashblock>,
+    flashblocks: Vec<Arc<Flashblock>>,
     headers: Vec<Sealed<Header>>,
 
-    transactions: Vec<Transaction>,
+    transactions: Vec<Arc<Transaction>>,
+    transactions_by_index: HashMap<B256, usize>,
+
+    transaction_state: HashMap<B256, EvmState>,
+    transaction_receipts: HashMap<B256, Arc<OpTransactionReceipt>>,
+
     account_balances: HashMap<Address, U256>,
     transaction_count: HashMap<Address, U256>,
-    transaction_receipts: HashMap<B256, OpTransactionReceipt>,
-    transactions_by_hash: HashMap<B256, Transaction>,
-    transaction_state: HashMap<B256, EvmState>,
+
     state_overrides: Option<StateOverride>,
 
     db_cache: Cache,
@@ -36,44 +41,50 @@ impl PendingBlocksBuilder {
             flashblocks: Vec::new(),
             headers: Vec::new(),
             transactions: Vec::new(),
+            transactions_by_index: HashMap::new(),
             account_balances: HashMap::new(),
             transaction_count: HashMap::new(),
             transaction_receipts: HashMap::new(),
-            transactions_by_hash: HashMap::new(),
             transaction_state: HashMap::new(),
             state_overrides: None,
             db_cache: Cache::default(),
         }
     }
 
+    /// Accept any iterator of Arc<Flashblock> to avoid forcing ownership moves/clones on callers.
     #[inline]
-    pub fn with_flashblocks(&mut self, flashblocks: Vec<Flashblock>) -> &Self {
-        self.flashblocks.extend(flashblocks);
+    pub fn with_flashblocks<I>(&mut self, iter: I) -> &mut Self
+    where
+        I: IntoIterator<Item = Arc<Flashblock>>,
+    {
+        self.flashblocks.extend(iter);
         self
     }
 
     #[inline]
-    pub fn with_header(&mut self, header: Sealed<Header>) -> &Self {
+    pub fn with_header(&mut self, header: Sealed<Header>) -> &mut Self {
         self.headers.push(header);
         self
     }
 
+    /// Store Transaction as Arc and keep index mapping to avoid duplicates and clones.
     #[inline]
-    pub(crate) fn with_transaction(&mut self, transaction: Transaction) -> &Self {
-        self.transactions_by_hash
-            .insert(transaction.tx_hash(), transaction.clone());
-        self.transactions.push(transaction);
+    pub(crate) fn with_transaction(&mut self, tx: Arc<Transaction>) -> &mut Self {
+        let idx = self.transactions.len();
+        let hash = tx.tx_hash();
+        self.transactions_by_index.insert(hash, idx);
+        self.transactions.push(tx);
         self
     }
 
     #[inline]
-    pub(crate) fn with_db_cache(&mut self, cache: Cache) -> &Self {
+    pub(crate) fn with_db_cache(&mut self, cache: Cache) -> &mut Self {
         self.db_cache = cache;
         self
     }
 
     #[inline]
-    pub(crate) fn with_transaction_state(&mut self, hash: B256, state: EvmState) -> &Self {
+    pub(crate) fn with_transaction_state(&mut self, hash: B256, state: EvmState) -> &mut Self {
         self.transaction_state.insert(hash, state);
         self
     }
@@ -90,7 +101,11 @@ impl PendingBlocksBuilder {
     }
 
     #[inline]
-    pub(crate) fn with_receipt(&mut self, hash: B256, receipt: OpTransactionReceipt) -> &Self {
+    pub(crate) fn with_receipt(
+        &mut self,
+        hash: B256,
+        receipt: Arc<OpTransactionReceipt>,
+    ) -> &mut Self {
         self.transaction_receipts.insert(hash, receipt);
         self
     }
@@ -107,11 +122,10 @@ impl PendingBlocksBuilder {
         self
     }
 
-    pub(crate) fn build(self) -> eyre::Result<PendingBlocks> {
+    pub fn build(self) -> eyre::Result<PendingBlocks> {
         if self.headers.is_empty() {
             return Err(eyre!("missing headers"));
         }
-
         if self.flashblocks.is_empty() {
             return Err(eyre!("no flashblocks"));
         }
@@ -120,27 +134,27 @@ impl PendingBlocksBuilder {
             flashblocks: self.flashblocks,
             headers: self.headers,
             transactions: self.transactions,
+            transactions_by_index: self.transactions_by_index,
+            transaction_state: self.transaction_state,
+            transaction_receipts: self.transaction_receipts,
             account_balances: self.account_balances,
             transaction_count: self.transaction_count,
-            transaction_receipts: self.transaction_receipts,
-            transactions_by_hash: self.transactions_by_hash,
-            transaction_state: self.transaction_state,
             state_overrides: self.state_overrides,
             db_cache: self.db_cache,
         })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PendingBlocks {
-    flashblocks: Vec<Flashblock>,
+    flashblocks: Vec<Arc<Flashblock>>,
     headers: Vec<Sealed<Header>>,
-    transactions: Vec<Transaction>,
+    transactions: Vec<Arc<Transaction>>,
+    transactions_by_index: HashMap<B256, usize>,
 
     account_balances: HashMap<Address, U256>,
     transaction_count: HashMap<Address, U256>,
-    transaction_receipts: HashMap<B256, OpTransactionReceipt>,
-    transactions_by_hash: HashMap<B256, Transaction>,
+    transaction_receipts: HashMap<B256, Arc<OpTransactionReceipt>>,
     transaction_state: HashMap<B256, EvmState>,
     state_overrides: Option<StateOverride>,
 
@@ -164,7 +178,7 @@ impl PendingBlocks {
         self.headers.last().unwrap().clone()
     }
 
-    pub fn get_flashblocks(&self) -> Vec<Flashblock> {
+    pub fn flashblocks(&self) -> Vec<Arc<Flashblock>> {
         self.flashblocks.clone()
     }
 
@@ -176,23 +190,32 @@ impl PendingBlocks {
         self.db_cache.clone()
     }
 
-    pub fn get_transactions_for_block(&self, block_number: BlockNumber) -> Vec<Transaction> {
-        self.transactions
-            .iter()
-            .filter(|tx| tx.block_number.unwrap_or(0) == block_number)
-            .cloned()
-            .collect()
+    pub fn transactions_for_block<'a>(
+        &'a self,
+        block_number: BlockNumber,
+    ) -> impl Iterator<Item = Arc<Transaction>> + 'a {
+        self.transactions.iter().filter_map(move |tx| {
+            tx.block_number.and_then(|bn| {
+                if bn == block_number {
+                    Some(Arc::clone(tx))
+                } else {
+                    None
+                }
+            })
+        })
     }
 
+    // Used only in rpc api only so far for clone is fine
     pub fn get_latest_block(&self, full: bool) -> RpcBlock<Optimism> {
         let header = self.latest_header();
         let block_number = header.number;
-        let block_transactions: Vec<Transaction> = self.get_transactions_for_block(block_number);
+        let block_transactions = self.transactions_for_block(block_number);
 
         let transactions = if full {
-            BlockTransactions::Full(block_transactions)
+            // Clone Arc<Transaction> into Transaction
+            BlockTransactions::Full(block_transactions.map(|tx| (*tx).clone()).collect())
         } else {
-            let tx_hashes: Vec<B256> = block_transactions.iter().map(|tx| tx.tx_hash()).collect();
+            let tx_hashes: Vec<B256> = block_transactions.map(|tx| tx.tx_hash()).collect();
             BlockTransactions::Hashes(tx_hashes)
         };
 
@@ -204,12 +227,15 @@ impl PendingBlocks {
         }
     }
 
-    pub fn get_receipt(&self, tx_hash: TxHash) -> Option<OpTransactionReceipt> {
+    pub fn get_receipt(&self, tx_hash: B256) -> Option<Arc<OpTransactionReceipt>> {
         self.transaction_receipts.get(&tx_hash).cloned()
     }
 
-    pub fn get_transaction_by_hash(&self, tx_hash: TxHash) -> Option<Transaction> {
-        self.transactions_by_hash.get(&tx_hash).cloned()
+    // return Arc<Transaction> so caller can cheaply share it
+    pub fn get_transaction_by_hash(&self, tx_hash: B256) -> Option<Arc<Transaction>> {
+        self.transactions_by_index
+            .get(&tx_hash)
+            .and_then(|&idx| self.transactions.get(idx).cloned())
     }
 
     pub fn get_transaction_count(&self, address: Address) -> U256 {
