@@ -14,6 +14,9 @@ pub struct Metrics {
     #[metric(describe = "Count of messages received from the upstream source")]
     pub upstream_messages: Counter,
 
+    #[metric(describe = "Time taken to decode a websocket message")]
+    pub websocket_decode_duration: Histogram,
+
     #[metric(describe = "Time taken to process a message")]
     pub block_processing_duration: Histogram,
 

@@ -7,8 +7,8 @@ use futures_util::{SinkExt as _, StreamExt};
 use reth_optimism_primitives::OpReceipt;
 use rollup_boost::{ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1};
 use serde::{Deserialize, Serialize};
-use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio::sync::oneshot;
+use tokio::time::{interval, Instant, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, trace, warn};
 use url::Url;
@@ -87,9 +87,7 @@ where
 
             loop {
                 let ws_stream = match connect_async(ws_url.as_str()).await {
-                    Ok((ws_stream, _)) => {
-                        ws_stream
-                    },
+                    Ok((ws_stream, _)) => ws_stream,
                     Err(e) => {
                         error!(
                             message = "WebSocket connection error, retrying",
@@ -119,8 +117,13 @@ where
                         loop {
                             ping_interval.tick().await;
                             let fut = write.send(Message::Ping(Default::default()));
-                            match tokio::time::timeout(Duration::from_millis(PING_SEND_TIMEOUT_MS), fut).await {
-                                Ok(Ok(())) => {}                // sent
+                            match tokio::time::timeout(
+                                Duration::from_millis(PING_SEND_TIMEOUT_MS),
+                                fut,
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {} // sent
                                 Ok(Err(_)) | Err(_) => {
                                     let _ = ping_err_tx.send(()); // notify reader and exit
                                     break;
@@ -146,15 +149,20 @@ where
                             idle.as_mut().reset(Instant::now() + Duration::from_millis(IDLE_TIMEOUT_MS));
 
                             match msg {
-                                Ok(Message::Binary(bytes)) => match try_decode_message(&bytes) {
-                                    Ok(payload) => {
-                                        flashblocks_state.on_flashblock_received(payload);
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            message = "error decoding flashblock message",
-                                            error = %e
-                                        );
+                                Ok(Message::Binary(bytes)) => {
+                                    let decode_time = Instant::now();
+                                    let decoded = try_decode_message(&bytes);
+                                    metrics.websocket_decode_duration.record(decode_time.elapsed());
+                                    match decoded {
+                                        Ok(payload) => {
+                                            flashblocks_state.on_flashblock_received(payload);
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                message = "error decoding flashblock message",
+                                                error = %e
+                                            );
+                                        }
                                     }
                                 },
                                 Ok(Message::Text(_)) => {
@@ -191,7 +199,7 @@ where
                             break 'conn;
                         }
                     }
-                };
+                }
                 ping_handle.abort();
             }
         });
@@ -200,7 +208,7 @@ where
 
 fn jitter(d: Duration) -> Duration {
     let ms = d.as_millis() as u64;
-    let jitter = fastrand::u64(0..(ms/2).max(1));
+    let jitter = fastrand::u64(0..(ms / 2).max(1));
     Duration::from_millis(ms.saturating_add(jitter))
 }
 
@@ -211,11 +219,11 @@ async fn sleep(metrics: &Metrics, backoff: Duration) -> Duration {
     std::cmp::min(backoff * 2, MAX_BACKOFF)
 }
 
+#[inline]
 fn try_decode_message(bytes: &[u8]) -> eyre::Result<Flashblock> {
     // Try plain JSON first (no String allocation)
-    match serde_json::from_slice(bytes) {
-        Ok(v) => return Ok(v),
-        Err(_) => {}
+    if let Ok(v) = serde_json::from_slice(bytes) {
+        return Ok(v);
     }
 
     // Fallback: stream-decompress brotli into serde_json without materializing a String
