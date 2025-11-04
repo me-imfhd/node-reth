@@ -7,7 +7,7 @@ use futures_util::{SinkExt as _, StreamExt};
 use reth_optimism_primitives::OpReceipt;
 use rollup_boost::{ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1};
 use serde::{Deserialize, Serialize};
-use tokio::time::{Instant, interval};
+use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio::sync::oneshot;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, trace, warn};
@@ -16,13 +16,13 @@ use url::Url;
 use crate::metrics::Metrics;
 
 /// Interval of liveness check of upstream, in milliseconds.
-pub const PING_INTERVAL_MS: u64 = 500;
+pub const PING_INTERVAL_MS: u64 = 15_000;
 
 /// Max duration of backoff before reconnecting to upstream.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
 /// Max duration of timeout for sending a ping to upstream.
-pub const PING_SEND_TIMEOUT_MS: u64 = 5000;
+pub const PING_SEND_TIMEOUT_MS: u64 = 250;
 
 /// Max duration of idle timeout before reconnecting to upstream.
 pub const IDLE_TIMEOUT_MS: u64 = 60_000;
@@ -115,6 +115,7 @@ where
                 let ping_handle = tokio::spawn({
                     async move {
                         let mut ping_interval = interval(Duration::from_millis(PING_INTERVAL_MS));
+                        ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
                         loop {
                             ping_interval.tick().await;
                             let fut = write.send(Message::Ping(Default::default()));
@@ -197,10 +198,16 @@ where
     }
 }
 
+fn jitter(d: Duration) -> Duration {
+    let ms = d.as_millis() as u64;
+    let jitter = fastrand::u64(0..(ms/2).max(1));
+    Duration::from_millis(ms.saturating_add(jitter))
+}
+
 /// Sleeps for given backoff duration. Returns incremented backoff duration, capped at [`MAX_BACKOFF`].
 async fn sleep(metrics: &Metrics, backoff: Duration) -> Duration {
     metrics.reconnect_attempts.increment(1);
-    tokio::time::sleep(backoff).await;
+    tokio::time::sleep(jitter(backoff)).await;
     std::cmp::min(backoff * 2, MAX_BACKOFF)
 }
 

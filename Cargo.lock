@@ -1512,6 +1512,7 @@ dependencies = [
  "arc-swap",
  "brotli",
  "eyre",
+ "fastrand",
  "futures-util",
  "jsonrpsee 0.26.0",
  "jsonrpsee-types 0.26.0",
