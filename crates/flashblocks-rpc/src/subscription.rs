@@ -5,9 +5,7 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_engine::PayloadId;
 use futures_util::{SinkExt as _, StreamExt};
 use reth_optimism_primitives::OpReceipt;
-use rollup_boost::{
-    ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, FlashblocksPayloadV1,
-};
+use rollup_boost::{ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -27,19 +25,25 @@ pub trait FlashblocksReceiver {
     fn on_flashblock_received(&self, flashblock: Flashblock);
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
 pub struct Metadata {
     pub receipts: HashMap<B256, OpReceipt>,
     pub new_account_balances: HashMap<Address, U256>,
     pub block_number: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, PartialEq, Default, Deserialize, Serialize)]
 pub struct Flashblock {
+    /// The payload id of the flashblock
     pub payload_id: PayloadId,
+    /// The index of the flashblock in the block
     pub index: u64,
+    /// The base execution payload configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<ExecutionPayloadBaseV1>,
+    /// The delta/diff containing modified portions of the execution payload
     pub diff: ExecutionPayloadFlashblockDeltaV1,
+    /// Additional metadata associated with the flashblock
     pub metadata: Metadata,
 }
 
@@ -99,7 +103,7 @@ where
                                     match msg {
                                         Ok(Message::Binary(bytes)) => match try_decode_message(&bytes) {
                                             Ok(payload) => {
-                                                let _ = sender.send(ActorMessage::BestPayload { payload: payload.clone() }).await.map_err(|e| {
+                                                let _ = sender.send(ActorMessage::BestPayload { payload }).await.map_err(|e| {
                                                     error!(message = "Failed to publish message to channel", error = %e);
                                                 });
                                             }
@@ -205,27 +209,14 @@ async fn sleep(metrics: &Metrics, backoff: Duration) -> Duration {
 fn try_decode_message(bytes: &[u8]) -> eyre::Result<Flashblock> {
     let text = try_parse_message(bytes)?;
 
-    let payload: FlashblocksPayloadV1 = match serde_json::from_str(&text) {
+    let payload: Flashblock = match serde_json::from_str(&text) {
         Ok(m) => m,
         Err(e) => {
             return Err(eyre::eyre!("failed to parse message: {}", e));
         }
     };
 
-    let metadata: Metadata = match serde_json::from_value(payload.metadata.clone()) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(eyre::eyre!("failed to parse message metadata: {}", e));
-        }
-    };
-
-    Ok(Flashblock {
-        payload_id: payload.payload_id,
-        index: payload.index,
-        base: payload.base,
-        diff: payload.diff,
-        metadata,
-    })
+    Ok(payload)
 }
 
 fn try_parse_message(bytes: &[u8]) -> eyre::Result<String> {
