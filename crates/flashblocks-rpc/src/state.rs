@@ -105,16 +105,18 @@ where
 
 impl<Client> FlashblocksReceiver for FlashblocksState<Client> {
     fn on_flashblock_received(&self, flashblock: Flashblock) {
-        match self.queue.send(StateUpdate::Flashblock(flashblock.clone())) {
+        let block_number = flashblock.metadata.block_number;
+        let flashblock_index = flashblock.index;
+        match self.queue.send(StateUpdate::Flashblock(flashblock)) {
             Ok(_) => {
                 info!(
                     message = "added flashblock to processing queue",
-                    block_number = flashblock.metadata.block_number,
-                    flashblock_index = flashblock.index
+                    block_number = block_number,
+                    flashblock_index = flashblock_index
                 );
             }
             Err(e) => {
-                error!(message = "could not add flashblock to processing queue", block_number = flashblock.metadata.block_number, flashblock_index = flashblock.index, error = %e);
+                error!(message = "could not add flashblock to processing queue", block_number = block_number, flashblock_index = flashblock_index, error = %e);
             }
         }
     }
