@@ -1,4 +1,4 @@
-use std::{io::Read, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::map::foldhash::HashMap;
 use alloy_primitives::{Address, B256, U256};
@@ -86,92 +86,10 @@ where
             let mut backoff = Duration::from_secs(1);
 
             loop {
-                match connect_async(ws_url.as_str()).await {
+                let ws_stream = match connect_async(ws_url.as_str()).await {
                     Ok((ws_stream, _)) => {
-                        info!(message = "WebSocket connection established");
-
-                        let mut ping_interval = interval(Duration::from_millis(PING_INTERVAL_MS));
-                        let mut awaiting_pong_resp = false;
-
-                        let (mut write, mut read) = ws_stream.split();
-
-                        'conn: loop {
-                            tokio::select! {
-                                Some(msg) = read.next() => {
-                                    metrics.upstream_messages.increment(1);
-
-                                    match msg {
-                                        Ok(Message::Binary(bytes)) => match try_decode_message(&bytes) {
-                                            Ok(payload) => {
-                                                let _ = sender.send(ActorMessage::BestPayload { payload }).await.map_err(|e| {
-                                                    error!(message = "Failed to publish message to channel", error = %e);
-                                                });
-                                            }
-                                            Err(e) => {
-                                                error!(
-                                                    message = "error decoding flashblock message",
-                                                    error = %e
-                                                );
-                                            }
-                                        },
-                                        Ok(Message::Text(_)) => {
-                                            error!("Received flashblock as plaintext, only compressed flashblocks supported. Set up websocket-proxy to use compressed flashblocks.");
-                                        }
-                                        Ok(Message::Close(_)) => {
-                                            info!(message = "WebSocket connection closed by upstream");
-                                            break;
-                                        }
-                                        Ok(Message::Pong(data)) => {
-                                            trace!(target: "flashblocks_rpc::subscription",
-                                                ?data,
-                                                "Received pong from upstream"
-                                            );
-                                            awaiting_pong_resp = false
-                                        }
-                                        Err(e) => {
-                                            metrics.upstream_errors.increment(1);
-                                            error!(
-                                                message = "error receiving message",
-                                                error = %e
-                                            );
-                                            break;
-                                        }
-                                        _ => {}
-                                    }
-                                },
-                                _ = ping_interval.tick() => {
-                                    if awaiting_pong_resp {
-                                          warn!(
-                                            target: "flashblocks_rpc::subscription",
-                                            ?backoff,
-                                            timeout_ms = PING_INTERVAL_MS,
-                                            "No pong response from upstream, reconnecting",
-                                        );
-
-                                        backoff = sleep(&metrics, backoff).await;
-                                        break 'conn;
-                                    }
-
-                                    trace!(target: "flashblocks_rpc::subscription",
-                                        "Sending ping to upstream"
-                                    );
-
-                                    if let Err(error) = write.send(Message::Ping(Default::default())).await {
-                                        warn!(
-                                            target: "flashblocks_rpc::subscription",
-                                            ?backoff,
-                                            %error,
-                                            "WebSocket connection lost, reconnecting",
-                                        );
-
-                                        backoff = sleep(&metrics, backoff).await;
-                                        break 'conn;
-                                    }
-                                    awaiting_pong_resp = true
-                                }
-                            }
-                        }
-                    }
+                        ws_stream
+                    },
                     Err(e) => {
                         error!(
                             message = "WebSocket connection error, retrying",
@@ -182,7 +100,92 @@ where
                         backoff = sleep(&metrics, backoff).await;
                         continue;
                     }
-                }
+                };
+
+                info!(message = "WebSocket connection established");
+
+                let mut ping_interval = interval(Duration::from_millis(PING_INTERVAL_MS));
+                let mut awaiting_pong_resp = false;
+
+                let (mut write, mut read) = ws_stream.split();
+
+                'conn: loop {
+                    tokio::select! {
+                        Some(msg) = read.next() => {
+                            metrics.upstream_messages.increment(1);
+
+                            match msg {
+                                Ok(Message::Binary(bytes)) => match try_decode_message(&bytes) {
+                                    Ok(payload) => {
+                                        let _ = sender.send(ActorMessage::BestPayload { payload }).await.map_err(|e| {
+                                            error!(message = "Failed to publish message to channel", error = %e);
+                                        });
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            message = "error decoding flashblock message",
+                                            error = %e
+                                        );
+                                    }
+                                },
+                                Ok(Message::Text(_)) => {
+                                    error!("Received flashblock as plaintext, only compressed flashblocks supported. Set up websocket-proxy to use compressed flashblocks.");
+                                }
+                                Ok(Message::Close(_)) => {
+                                    info!(message = "WebSocket connection closed by upstream");
+                                    break;
+                                }
+                                Ok(Message::Pong(data)) => {
+                                    trace!(target: "flashblocks_rpc::subscription",
+                                        ?data,
+                                        "Received pong from upstream"
+                                    );
+                                    awaiting_pong_resp = false
+                                }
+                                Err(e) => {
+                                    metrics.upstream_errors.increment(1);
+                                    error!(
+                                        message = "error receiving message",
+                                        error = %e
+                                    );
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        },
+                        _ = ping_interval.tick() => {
+                            if awaiting_pong_resp {
+                                  warn!(
+                                    target: "flashblocks_rpc::subscription",
+                                    ?backoff,
+                                    timeout_ms = PING_INTERVAL_MS,
+                                    "No pong response from upstream, reconnecting",
+                                );
+
+                                backoff = sleep(&metrics, backoff).await;
+                                break 'conn;
+                            }
+
+                            trace!(target: "flashblocks_rpc::subscription",
+                                "Sending ping to upstream"
+                            );
+
+                            if let Err(error) = write.send(Message::Ping(Default::default())).await {
+                                warn!(
+                                    target: "flashblocks_rpc::subscription",
+                                    ?backoff,
+                                    %error,
+                                    "WebSocket connection lost, reconnecting",
+                                );
+
+                                backoff = sleep(&metrics, backoff).await;
+                                break 'conn;
+                            }
+                            awaiting_pong_resp = true
+                        }
+                    }
+                };
+
             }
         });
 
@@ -207,29 +210,14 @@ async fn sleep(metrics: &Metrics, backoff: Duration) -> Duration {
 }
 
 fn try_decode_message(bytes: &[u8]) -> eyre::Result<Flashblock> {
-    let text = try_parse_message(bytes)?;
-
-    let payload: Flashblock = match serde_json::from_str(&text) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(eyre::eyre!("failed to parse message: {}", e));
-        }
-    };
-
-    Ok(payload)
-}
-
-fn try_parse_message(bytes: &[u8]) -> eyre::Result<String> {
-    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-        if text.trim_start().starts_with("{") {
-            return Ok(text);
-        }
+    // Try plain JSON first (no String allocation)
+    match serde_json::from_slice(bytes) {
+        Ok(v) => return Ok(v),
+        Err(_) => {}
     }
 
-    let mut decompressor = brotli::Decompressor::new(bytes, 4096);
-    let mut decompressed = Vec::new();
-    decompressor.read_to_end(&mut decompressed)?;
-
-    let text = String::from_utf8(decompressed)?;
-    Ok(text)
+    // Fallback: stream-decompress brotli into serde_json without materializing a String
+    let mut decomp = brotli::Decompressor::new(bytes, 4096);
+    let v = serde_json::from_reader(&mut decomp)?;
+    Ok(v)
 }
