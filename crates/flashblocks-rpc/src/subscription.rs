@@ -151,7 +151,17 @@ where
                             match msg {
                                 Ok(Message::Binary(bytes)) => {
                                     let decode_time = Instant::now();
-                                    let decoded = try_decode_message(&bytes);
+                                    // Do in a blocking task to avoid blocking the async task scheduler
+                                    let decoded = match tokio::task::spawn_blocking(move || try_decode_message(&bytes)).await {
+                                        Ok(decoded) => decoded,
+                                        Err(e) => {
+                                                error!(
+                                                    message = "error joining blocking websocket decode task",
+                                                    error = %e
+                                                );
+                                                continue;
+                                            }
+                                    };
                                     metrics.websocket_decode_duration.record(decode_time.elapsed());
                                     match decoded {
                                         Ok(payload) => {
