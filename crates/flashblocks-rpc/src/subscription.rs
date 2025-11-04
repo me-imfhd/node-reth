@@ -7,7 +7,8 @@ use futures_util::{SinkExt as _, StreamExt};
 use reth_optimism_primitives::OpReceipt;
 use rollup_boost::{ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1};
 use serde::{Deserialize, Serialize};
-use tokio::time::interval;
+use tokio::time::{Instant, interval};
+use tokio::sync::oneshot;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, trace, warn};
 use url::Url;
@@ -19,6 +20,12 @@ pub const PING_INTERVAL_MS: u64 = 500;
 
 /// Max duration of backoff before reconnecting to upstream.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Max duration of timeout for sending a ping to upstream.
+pub const PING_SEND_TIMEOUT_MS: u64 = 5000;
+
+/// Max duration of idle timeout before reconnecting to upstream.
+pub const IDLE_TIMEOUT_MS: u64 = 60_000;
 
 pub trait FlashblocksReceiver {
     fn on_flashblock_received(&self, flashblock: Flashblock);
@@ -74,6 +81,7 @@ where
 
         let flashblocks_state = self.flashblocks_state.clone();
         let metrics = self.metrics.clone();
+
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
 
@@ -95,16 +103,46 @@ where
                 };
 
                 info!(message = "WebSocket connection established");
+                // Reset backoff to 1 second
+                backoff = Duration::from_secs(1);
 
-                let mut ping_interval = interval(Duration::from_millis(PING_INTERVAL_MS));
-                let mut awaiting_pong_resp = false;
+                let idle = tokio::time::sleep(Duration::from_millis(IDLE_TIMEOUT_MS));
+                tokio::pin!(idle);
 
                 let (mut write, mut read) = ws_stream.split();
 
+                let (ping_err_tx, mut ping_err_rx) = oneshot::channel::<()>();
+                let ping_handle = tokio::spawn({
+                    async move {
+                        let mut ping_interval = interval(Duration::from_millis(PING_INTERVAL_MS));
+                        loop {
+                            ping_interval.tick().await;
+                            let fut = write.send(Message::Ping(Default::default()));
+                            match tokio::time::timeout(Duration::from_millis(PING_SEND_TIMEOUT_MS), fut).await {
+                                Ok(Ok(())) => {}                // sent
+                                Ok(Err(_)) | Err(_) => {
+                                    let _ = ping_err_tx.send(()); // notify reader and exit
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+
                 'conn: loop {
                     tokio::select! {
+                        _ = &mut idle => {
+                            warn!(
+                                target: "flashblocks_rpc::subscription",
+                                ?backoff,
+                                "Idle timeout, reconnecting"
+                            );
+                            backoff = sleep(&metrics, backoff).await;
+                            break 'conn;
+                        }
                         Some(msg) = read.next() => {
                             metrics.upstream_messages.increment(1);
+                            idle.as_mut().reset(Instant::now() + Duration::from_millis(IDLE_TIMEOUT_MS));
 
                             match msg {
                                 Ok(Message::Binary(bytes)) => match try_decode_message(&bytes) {
@@ -130,7 +168,6 @@ where
                                         ?data,
                                         "Received pong from upstream"
                                     );
-                                    awaiting_pong_resp = false
                                 }
                                 Err(e) => {
                                     metrics.upstream_errors.increment(1);
@@ -143,39 +180,18 @@ where
                                 _ => {}
                             }
                         },
-                        _ = ping_interval.tick() => {
-                            if awaiting_pong_resp {
-                                  warn!(
-                                    target: "flashblocks_rpc::subscription",
-                                    ?backoff,
-                                    timeout_ms = PING_INTERVAL_MS,
-                                    "No pong response from upstream, reconnecting",
-                                );
-
-                                backoff = sleep(&metrics, backoff).await;
-                                break 'conn;
-                            }
-
-                            trace!(target: "flashblocks_rpc::subscription",
-                                "Sending ping to upstream"
+                        _ = &mut ping_err_rx => {
+                            warn!(
+                                target: "flashblocks_rpc::subscription",
+                                ?backoff,
+                                "Ping task failed, reconnecting"
                             );
-
-                            if let Err(error) = write.send(Message::Ping(Default::default())).await {
-                                warn!(
-                                    target: "flashblocks_rpc::subscription",
-                                    ?backoff,
-                                    %error,
-                                    "WebSocket connection lost, reconnecting",
-                                );
-
-                                backoff = sleep(&metrics, backoff).await;
-                                break 'conn;
-                            }
-                            awaiting_pong_resp = true
+                            backoff = sleep(&metrics, backoff).await;
+                            break 'conn;
                         }
                     }
                 };
-
+                ping_handle.abort();
             }
         });
     }
