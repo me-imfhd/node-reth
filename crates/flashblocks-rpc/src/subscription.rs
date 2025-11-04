@@ -7,7 +7,6 @@ use futures_util::{SinkExt as _, StreamExt};
 use reth_optimism_primitives::OpReceipt;
 use rollup_boost::{ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 use tokio::time::interval;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, trace, warn};
@@ -47,12 +46,6 @@ pub struct Flashblock {
     pub metadata: Metadata,
 }
 
-// Simplify actor messages to just handle shutdown
-#[derive(Debug)]
-enum ActorMessage {
-    BestPayload { payload: Flashblock },
-}
-
 pub struct FlashblocksSubscriber<Receiver> {
     flashblocks_state: Arc<Receiver>,
     metrics: Metrics,
@@ -79,8 +72,7 @@ where
 
         let ws_url = self.ws_url.clone();
 
-        let (sender, mut mailbox) = mpsc::channel(100);
-
+        let flashblocks_state = self.flashblocks_state.clone();
         let metrics = self.metrics.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
@@ -117,9 +109,7 @@ where
                             match msg {
                                 Ok(Message::Binary(bytes)) => match try_decode_message(&bytes) {
                                     Ok(payload) => {
-                                        let _ = sender.send(ActorMessage::BestPayload { payload }).await.map_err(|e| {
-                                            error!(message = "Failed to publish message to channel", error = %e);
-                                        });
+                                        flashblocks_state.on_flashblock_received(payload);
                                     }
                                     Err(e) => {
                                         error!(
@@ -186,17 +176,6 @@ where
                     }
                 };
 
-            }
-        });
-
-        let flashblocks_state = self.flashblocks_state.clone();
-        tokio::spawn(async move {
-            while let Some(message) = mailbox.recv().await {
-                match message {
-                    ActorMessage::BestPayload { payload } => {
-                        flashblocks_state.on_flashblock_received(payload);
-                    }
-                }
             }
         });
     }
