@@ -36,9 +36,6 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 
-[build]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
-
 [workspace.dependencies]
 # internal
 base-reth-flashblocks-rpc = { path = "crates/flashblocks-rpc" }
