@@ -238,6 +238,6 @@ fn try_decode_message(bytes: &[u8]) -> eyre::Result<Flashblock> {
 
     // Fallback: stream-decompress brotli into serde_json without materializing a String
     let mut decomp = brotli::Decompressor::new(bytes, 4096);
-    let v = serde_json::from_reader(&mut decomp)?;
+    let v = sonic_rs::from_reader(&mut decomp)?;
     Ok(v)
 }

@@ -36,6 +36,9 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
 [workspace.dependencies]
 # internal
 base-reth-flashblocks-rpc = { path = "crates/flashblocks-rpc" }
@@ -120,6 +123,7 @@ clap = { version = "4.4.3" }
 tracing = { version = "0.1.41" }
 serde = "1"
 serde_json = "1.0"
+sonic-rs = { version="0.5.6" }
 url = "2.5"
 metrics = "0.24.1"
 metrics-derive = "0.1"
