@@ -506,7 +506,8 @@ where
             let block: OpBlock = execution_payload.try_into_block()?;
             let mut l1_block_info = reth_optimism_evm::extract_l1_info(&block.body)?;
             let header = block.header.clone().seal_slow();
-            pending_blocks_builder.with_header(header.clone());
+            let header_hash = header.hash_ref().clone();
+            pending_blocks_builder.with_header(header);
 
             let block_env_attributes = OpNextBlockEnvAttributes {
                 timestamp: base.timestamp,
@@ -514,7 +515,7 @@ where
                 prev_randao: base.prev_randao,
                 gas_limit: base.gas_limit,
                 parent_beacon_block_root: Some(base.parent_beacon_block_root),
-                extra_data: base.extra_data.clone(),
+                extra_data: base.extra_data,
             };
 
             let new_config = evm_config.next_evm_env(&last_block_header, &block_env_attributes)?;
@@ -524,7 +525,16 @@ where
             let mut gas_used = 0;
             let mut next_log_index = 0;
 
-            for (idx, transaction) in block.body.transactions.iter().enumerate() {
+            let Header {
+                number,
+                base_fee_per_gas,
+                excess_blob_gas,
+                timestamp,
+                ..
+            } = block.header;
+
+            for (idx, transaction) in block.body.transactions.into_iter().enumerate() {
+                let tx_hash = transaction.tx_hash();
                 let sender = match transaction.recover_signer() {
                     Ok(signer) => signer,
                     Err(err) => return Err(err.into()),
@@ -532,12 +542,35 @@ where
                 pending_blocks_builder.increment_nonce(sender);
 
                 let receipt = receipt_by_hash
-                    .get(&transaction.tx_hash())
+                    .get(&tx_hash)
                     .cloned()
-                    .ok_or(eyre!("missing receipt for {:?}", transaction.tx_hash()))?;
+                    .ok_or(eyre!("missing receipt for {:?}", tx_hash))?;
 
-                let recovered_transaction = Recovered::new_unchecked(transaction.clone(), sender);
-                let envelope = recovered_transaction.clone().convert::<OpTxEnvelope>();
+                // Receipt Generation
+                let meta = TransactionMeta {
+                    tx_hash: tx_hash,
+                    index: idx as u64,
+                    block_hash: header_hash,
+                    block_number: number,
+                    base_fee: base_fee_per_gas,
+                    excess_blob_gas: excess_blob_gas,
+                    timestamp: timestamp,
+                };
+
+                let input: ConvertReceiptInput<'_, OpPrimitives> = ConvertReceiptInput {
+                    receipt: receipt.clone(),
+                    tx: Recovered::new_unchecked(&transaction, sender),
+                    gas_used: receipt.cumulative_gas_used() - gas_used,
+                    next_log_index,
+                    meta,
+                };
+
+                let op_receipt = OpReceiptBuilder::new(
+                    self.client.chain_spec().as_ref(),
+                    input,
+                    &mut l1_block_info,
+                )?
+                .build();
 
                 // Build Transaction
                 let (deposit_receipt_version, deposit_nonce) = if transaction.is_deposit() {
@@ -556,8 +589,7 @@ where
                 let effective_gas_price = if transaction.is_deposit() {
                     0
                 } else {
-                    block
-                        .base_fee_per_gas
+                    base_fee_per_gas
                         .map(|base_fee| {
                             transaction
                                 .effective_tip_per_gas(base_fee)
@@ -567,10 +599,13 @@ where
                         .unwrap_or_else(|| transaction.max_fee_per_gas())
                 };
 
+                let recovered_transaction = Recovered::new_unchecked(transaction, sender);
+                let envelope = recovered_transaction.clone().convert::<OpTxEnvelope>();
+
                 let rpc_txn = Transaction {
                     inner: alloy_rpc_types_eth::Transaction {
                         inner: envelope,
-                        block_hash: Some(header.hash()),
+                        block_hash: Some(header_hash),
                         block_number: Some(base.block_number),
                         transaction_index: Some(idx as u64),
                         effective_gas_price: Some(effective_gas_price),
@@ -579,55 +614,18 @@ where
                     deposit_receipt_version,
                 };
 
-                pending_blocks_builder.with_transaction(Arc::new(rpc_txn));
-
-                // Receipt Generation
-                let meta = TransactionMeta {
-                    tx_hash: transaction.tx_hash(),
-                    index: idx as u64,
-                    block_hash: header.hash(),
-                    block_number: block.number,
-                    base_fee: block.base_fee_per_gas,
-                    excess_blob_gas: block.excess_blob_gas,
-                    timestamp: block.timestamp,
-                };
-
-                let input: ConvertReceiptInput<'_, OpPrimitives> = ConvertReceiptInput {
-                    receipt: receipt.clone(),
-                    tx: Recovered::new_unchecked(transaction, sender),
-                    gas_used: receipt.cumulative_gas_used() - gas_used,
-                    next_log_index,
-                    meta,
-                };
-
-                let op_receipt = OpReceiptBuilder::new(
-                    self.client.chain_spec().as_ref(),
-                    input,
-                    &mut l1_block_info,
-                )?
-                .build();
-
-                pending_blocks_builder.with_receipt(transaction.tx_hash(), Arc::new(op_receipt));
+                pending_blocks_builder
+                    .with_transaction_and_receipt(Arc::new(rpc_txn), Arc::new(op_receipt));
                 gas_used = receipt.cumulative_gas_used();
                 next_log_index += receipt.logs().len();
 
-                let mut should_execute_transaction = false;
-                match &prev_pending_blocks {
-                    Some(pending_blocks) => {
-                        match pending_blocks.get_transaction_state(transaction.tx_hash()) {
-                            Some(state) => {
-                                pending_blocks_builder
-                                    .with_transaction_state(transaction.tx_hash(), state);
-                            }
-                            None => {
-                                should_execute_transaction = true;
-                            }
-                        }
-                    }
-                    None => {
-                        should_execute_transaction = true;
-                    }
-                }
+                let should_execute_transaction = match &prev_pending_blocks {
+                    Some(pending_blocks) => match pending_blocks.get_transaction_by_hash(tx_hash) {
+                        Some(_) => false,
+                        None => true,
+                    },
+                    None => true,
+                };
 
                 if should_execute_transaction {
                     match evm.transact(recovered_transaction) {
@@ -638,7 +636,7 @@ where
                                 existing_override.balance = Some(acc.info.balance);
                                 existing_override.nonce = Some(acc.info.nonce);
                                 existing_override.code =
-                                    acc.info.code.clone().map(|code| code.bytes());
+                                    acc.info.code.as_ref().map(|code| code.bytes());
 
                                 let existing = existing_override
                                     .state_diff
@@ -649,15 +647,14 @@ where
 
                                 existing.extend(changed_slots);
                             }
-                            pending_blocks_builder
-                                .with_transaction_state(transaction.tx_hash(), state.clone());
+
                             evm.db_mut().commit(state);
                         }
                         Err(e) => {
                             return Err(eyre!(
                                 "failed to execute transaction: {:?} tx_hash: {:?} sender: {:?}",
                                 e,
-                                transaction.tx_hash(),
+                                tx_hash,
                                 sender
                             ));
                         }
