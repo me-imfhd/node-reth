@@ -12,7 +12,7 @@ use alloy_rpc_types_eth::{Filter, Header as RPCHeader, Log};
 use eyre::eyre;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::{OpTransactionReceipt, Transaction};
-use reth::revm::{db::Cache, state::EvmState};
+use reth::revm::db::Cache;
 use reth_rpc_eth_api::RpcBlock;
 
 use crate::subscription::Flashblock;
@@ -24,8 +24,7 @@ pub struct PendingBlocksBuilder {
     transactions: Vec<Arc<Transaction>>,
     transactions_by_index: HashMap<B256, usize>,
 
-    transaction_state: HashMap<B256, EvmState>,
-    transaction_receipts: HashMap<B256, Arc<OpTransactionReceipt>>,
+    transaction_receipts: Vec<Arc<OpTransactionReceipt>>,
 
     account_balances: HashMap<Address, U256>,
     transaction_count: HashMap<Address, U256>,
@@ -44,8 +43,7 @@ impl PendingBlocksBuilder {
             transactions_by_index: HashMap::new(),
             account_balances: HashMap::new(),
             transaction_count: HashMap::new(),
-            transaction_receipts: HashMap::new(),
-            transaction_state: HashMap::new(),
+            transaction_receipts: Vec::new(),
             state_overrides: None,
             db_cache: Cache::default(),
         }
@@ -69,23 +67,22 @@ impl PendingBlocksBuilder {
 
     /// Store Transaction as Arc and keep index mapping to avoid duplicates and clones.
     #[inline]
-    pub(crate) fn with_transaction(&mut self, tx: Arc<Transaction>) -> &mut Self {
+    pub(crate) fn with_transaction_and_receipt(
+        &mut self,
+        tx: Arc<Transaction>,
+        receipt: Arc<OpTransactionReceipt>,
+    ) -> &mut Self {
         let idx = self.transactions.len();
         let hash = tx.tx_hash();
         self.transactions_by_index.insert(hash, idx);
         self.transactions.push(tx);
+        self.transaction_receipts.push(receipt);
         self
     }
 
     #[inline]
     pub(crate) fn with_db_cache(&mut self, cache: Cache) -> &mut Self {
         self.db_cache = cache;
-        self
-    }
-
-    #[inline]
-    pub(crate) fn with_transaction_state(&mut self, hash: B256, state: EvmState) -> &mut Self {
-        self.transaction_state.insert(hash, state);
         self
     }
 
@@ -97,16 +94,6 @@ impl PendingBlocksBuilder {
         _ = self
             .transaction_count
             .insert(sender, *current_count + U256::from(1));
-        self
-    }
-
-    #[inline]
-    pub(crate) fn with_receipt(
-        &mut self,
-        hash: B256,
-        receipt: Arc<OpTransactionReceipt>,
-    ) -> &mut Self {
-        self.transaction_receipts.insert(hash, receipt);
         self
     }
 
@@ -135,7 +122,7 @@ impl PendingBlocksBuilder {
             headers: self.headers,
             transactions: self.transactions,
             transactions_by_index: self.transactions_by_index,
-            transaction_state: self.transaction_state,
+            // transaction_state: self.transaction_state,
             transaction_receipts: self.transaction_receipts,
             account_balances: self.account_balances,
             transaction_count: self.transaction_count,
@@ -154,8 +141,7 @@ pub struct PendingBlocks {
 
     account_balances: HashMap<Address, U256>,
     transaction_count: HashMap<Address, U256>,
-    transaction_receipts: HashMap<B256, Arc<OpTransactionReceipt>>,
-    transaction_state: HashMap<B256, EvmState>,
+    transaction_receipts: Vec<Arc<OpTransactionReceipt>>,
     state_overrides: Option<StateOverride>,
 
     db_cache: Cache,
@@ -180,10 +166,6 @@ impl PendingBlocks {
 
     pub fn flashblocks(&self) -> Vec<Arc<Flashblock>> {
         self.flashblocks.clone()
-    }
-
-    pub fn get_transaction_state(&self, hash: B256) -> Option<EvmState> {
-        self.transaction_state.get(&hash).cloned()
     }
 
     pub fn get_db_cache(&self) -> Cache {
@@ -228,7 +210,9 @@ impl PendingBlocks {
     }
 
     pub fn get_receipt(&self, tx_hash: B256) -> Option<Arc<OpTransactionReceipt>> {
-        self.transaction_receipts.get(&tx_hash).cloned()
+        self.transactions_by_index
+            .get(&tx_hash)
+            .and_then(|&idx| self.transaction_receipts.get(idx).cloned())
     }
 
     // return Arc<Transaction> so caller can cheaply share it
@@ -257,7 +241,7 @@ impl PendingBlocks {
         let mut logs = Vec::new();
 
         // Iterate through all transaction receipts in pending state
-        for receipt in self.transaction_receipts.values() {
+        for receipt in &self.transaction_receipts {
             for log in receipt.inner.logs() {
                 if filter.matches(&log.inner) {
                     logs.push(log.clone());
