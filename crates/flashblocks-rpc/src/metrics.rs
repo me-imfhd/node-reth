@@ -41,14 +41,14 @@ pub struct Metrics {
     #[metric(describe = "Time taken to execute a transaction in EVM")]
     pub evm_transact_duration: Histogram,
 
+    #[metric(describe = "Time taken to process a all transaction (receipt building, etc.)")]
+    pub total_txn_execution_duration: Histogram,
+
+    #[metric(describe = "Time taken to process a all transaction (receipt building, etc.)")]
+    pub total_txn_processing_duration: Histogram,
+
     #[metric(describe = "Time taken to update state overrides after transaction execution")]
     pub state_override_update_duration: Histogram,
-
-    #[metric(describe = "Total number of transactions processed per flashblock")]
-    pub total_transactions_processed: Histogram,
-
-    #[metric(describe = "Total number of transactions executed in EVM per flashblock")]
-    pub total_transactions_executed: Histogram,
 
     #[metric(describe = "Number of Flashblocks that arrive in an unexpected order")]
     pub unexpected_block_order: Counter,

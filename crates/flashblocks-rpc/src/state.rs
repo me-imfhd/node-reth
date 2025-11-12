@@ -13,7 +13,6 @@ use alloy_rpc_types_eth::state::StateOverride;
 use alloy_rpc_types_eth::{Filter, Log};
 use arc_swap::{ArcSwapOption, Guard};
 use eyre::eyre;
-use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_network::{Optimism, TransactionResponse};
 use op_alloy_rpc_types::Transaction;
 use reth::chainspec::{ChainSpecProvider, EthChainSpec};
@@ -32,7 +31,7 @@ use reth_rpc_convert::{transaction::ConvertReceiptInput, RpcTransaction};
 use reth_rpc_eth_api::{RpcBlock, RpcReceipt};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast::{self, Sender};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::Mutex;
@@ -457,6 +456,8 @@ where
             .evm_setup_duration
             .record(evm_setup_start.elapsed());
 
+        let mut total_txn_execution_duration: u128 = 0;
+        let mut total_txn_processing_duration: u128 = 0;
         for (_block_number, block_flashblocks) in flashblocks_per_block {
             let base = block_flashblocks
                 .first()
@@ -554,15 +555,20 @@ where
                 ..
             } = block.header;
 
-            let total_tx_count = block.body.transactions.len();
-            let mut executed_tx_count = 0;
-
             for (idx, transaction) in block.body.transactions.into_iter().enumerate() {
                 let tx_process_start = Instant::now();
                 let tx_hash = transaction.tx_hash();
-                let sender = match transaction.recover_signer() {
-                    Ok(signer) => signer,
-                    Err(err) => return Err(err.into()),
+
+                let sender_from_prev = match &prev_pending_blocks {
+                    Some(ppb) => match ppb.get_transaction_by_hash(tx_hash) {
+                        Some(tx) => Some(tx.inner.inner.signer()),
+                        None => None,
+                    },
+                    None => None,
+                };
+                let sender = match sender_from_prev {
+                    Some(sender) => sender,
+                    None => transaction.recover_signer()?,
                 };
                 pending_blocks_builder.increment_nonce(sender);
 
@@ -625,11 +631,10 @@ where
                 };
 
                 let recovered_transaction = Recovered::new_unchecked(transaction, sender);
-                let envelope = recovered_transaction.clone().convert::<OpTxEnvelope>();
 
                 let rpc_txn = Transaction {
                     inner: alloy_rpc_types_eth::Transaction {
-                        inner: envelope,
+                        inner: recovered_transaction.clone(),
                         block_hash: Some(header_hash),
                         block_number: Some(base.block_number),
                         transaction_index: Some(idx as u64),
@@ -643,23 +648,17 @@ where
                     .with_transaction_and_receipt(Arc::new(rpc_txn), Arc::new(op_receipt));
                 gas_used = receipt.cumulative_gas_used();
                 next_log_index += receipt.logs().len();
-
-                let should_execute_transaction = match &prev_pending_blocks {
-                    Some(pending_blocks) => match pending_blocks.get_transaction_by_hash(tx_hash) {
-                        Some(_) => false,
-                        None => true,
-                    },
-                    None => true,
-                };
+                let should_execute_transaction = sender_from_prev.is_none();
 
                 if should_execute_transaction {
-                    executed_tx_count += 1;
                     let evm_transact_start = Instant::now();
                     match evm.transact(recovered_transaction) {
                         Ok(ResultAndState { state, .. }) => {
+                            let evm_transact_elapsed = evm_transact_start.elapsed();
+                            total_txn_execution_duration += evm_transact_elapsed.as_micros();
                             self.metrics
                                 .evm_transact_duration
-                                .record(evm_transact_start.elapsed());
+                                .record(evm_transact_elapsed);
 
                             let state_override_start = Instant::now();
                             for (addr, acc) in &state {
@@ -696,9 +695,11 @@ where
                     }
                 }
 
+                let processing_elapsed = tx_process_start.elapsed();
+                total_txn_processing_duration += processing_elapsed.as_micros();
                 self.metrics
                     .transaction_processing_duration
-                    .record(tx_process_start.elapsed());
+                    .record(processing_elapsed);
             }
 
             pending_blocks_builder.with_flashblocks(block_flashblocks.into_iter());
@@ -707,15 +708,14 @@ where
                 pending_blocks_builder.with_account_balance(address, balance);
             }
 
-            self.metrics
-                .total_transactions_processed
-                .record(total_tx_count as f64);
-            self.metrics
-                .total_transactions_executed
-                .record(executed_tx_count as f64);
-
             last_block_header = block.header.clone();
         }
+        self.metrics
+            .total_txn_processing_duration
+            .record(Duration::from_micros(total_txn_processing_duration as u64));
+        self.metrics
+            .total_txn_execution_duration
+            .record(Duration::from_micros(total_txn_execution_duration as u64));
 
         pending_blocks_builder.with_db_cache(evm.into_db().cache);
         pending_blocks_builder.with_state_overrides(state_overrides);
