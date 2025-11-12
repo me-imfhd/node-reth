@@ -17,6 +17,36 @@ pub struct Metrics {
     #[metric(describe = "Time taken to process a message")]
     pub block_processing_duration: Histogram,
 
+    #[metric(describe = "Time taken to clone flashblocks vector")]
+    pub flashblock_clone_duration: Histogram,
+
+    #[metric(describe = "Time taken to query header by number from database")]
+    pub db_query_header_duration: Histogram,
+
+    #[metric(describe = "Time taken to query state by block number from database")]
+    pub db_query_state_duration: Histogram,
+
+    #[metric(describe = "Time taken to set up EVM instance")]
+    pub evm_setup_duration: Histogram,
+
+    #[metric(describe = "Time taken to build data structures (transactions, receipts, etc.)")]
+    pub data_structure_build_duration: Histogram,
+
+    #[metric(describe = "Time taken to process a single transaction (receipt building, etc.)")]
+    pub transaction_processing_duration: Histogram,
+
+    #[metric(describe = "Time taken to execute a transaction in EVM")]
+    pub evm_transact_duration: Histogram,
+
+    #[metric(describe = "Time taken to update state overrides after transaction execution")]
+    pub state_override_update_duration: Histogram,
+
+    #[metric(describe = "Total number of transactions processed per flashblock")]
+    pub total_transactions_processed: Histogram,
+
+    #[metric(describe = "Total number of transactions executed in EVM per flashblock")]
+    pub total_transactions_executed: Histogram,
+
     #[metric(describe = "Number of Flashblocks that arrive in an unexpected order")]
     pub unexpected_block_order: Counter,
 
