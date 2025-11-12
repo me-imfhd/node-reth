@@ -337,7 +337,11 @@ where
                 if self.is_next_flashblock(pending_blocks, &flashblock) {
                     // We have received the next flashblock for the current block
                     // or the first flashblock for the next block
+                    let clone_start = Instant::now();
                     let mut flashblocks = pending_blocks.flashblocks();
+                    self.metrics
+                        .flashblock_clone_duration
+                        .record(clone_start.elapsed());
                     flashblocks.push(Arc::new(flashblock));
                     self.build_pending_state(prev_pending_blocks, flashblocks)
                 } else if pending_blocks.latest_block_number() != flashblock.metadata.block_number {
@@ -398,16 +402,26 @@ where
 
         let earliest_block_number = flashblocks_per_block.keys().min().unwrap();
         let canonical_block = earliest_block_number - 1;
+
+        let db_header_start = Instant::now();
         let mut last_block_header = self.client.header_by_number(canonical_block)?.ok_or(eyre!(
             "Failed to extract header for canonical block number {}. This is okay if your node is not fully synced to tip yet.",
             canonical_block
         ))?;
+        self.metrics
+            .db_query_header_duration
+            .record(db_header_start.elapsed());
 
         let evm_config = OpEvmConfig::optimism(self.client.chain_spec());
 
+        let db_state_start = Instant::now();
         let state_provider = self
             .client
             .state_by_block_number_or_tag(BlockNumberOrTag::Number(canonical_block))?;
+        self.metrics
+            .db_query_state_duration
+            .record(db_state_start.elapsed());
+        let evm_setup_start = Instant::now();
         let state_provider_db = StateProviderDatabase::new(state_provider);
         let state = State::builder()
             .with_database(state_provider_db)
@@ -439,6 +453,9 @@ where
             },
         )?;
         let mut evm = evm_config.evm_with_env(db, evm_env);
+        self.metrics
+            .evm_setup_duration
+            .record(evm_setup_start.elapsed());
 
         for (_block_number, block_flashblocks) in flashblocks_per_block {
             let base = block_flashblocks
@@ -453,6 +470,7 @@ where
                 .cloned()
                 .ok_or(eyre!("cannot build a pending block from no flashblocks"))?;
 
+            let data_build_start = Instant::now();
             let transactions: Vec<Bytes> = block_flashblocks
                 .iter()
                 .flat_map(|flashblock| flashblock.diff.transactions.clone())
@@ -478,6 +496,9 @@ where
                     acc.extend(balances);
                     acc
                 });
+            self.metrics
+                .data_structure_build_duration
+                .record(data_build_start.elapsed());
 
             let execution_payload: ExecutionPayloadV3 = ExecutionPayloadV3 {
                 blob_gas_used: 0,
@@ -533,7 +554,11 @@ where
                 ..
             } = block.header;
 
+            let total_tx_count = block.body.transactions.len();
+            let mut executed_tx_count = 0;
+
             for (idx, transaction) in block.body.transactions.into_iter().enumerate() {
+                let tx_process_start = Instant::now();
                 let tx_hash = transaction.tx_hash();
                 let sender = match transaction.recover_signer() {
                     Ok(signer) => signer,
@@ -628,8 +653,15 @@ where
                 };
 
                 if should_execute_transaction {
+                    executed_tx_count += 1;
+                    let evm_transact_start = Instant::now();
                     match evm.transact(recovered_transaction) {
                         Ok(ResultAndState { state, .. }) => {
+                            self.metrics
+                                .evm_transact_duration
+                                .record(evm_transact_start.elapsed());
+
+                            let state_override_start = Instant::now();
                             for (addr, acc) in &state {
                                 let existing_override =
                                     state_overrides.entry(*addr).or_insert(Default::default());
@@ -647,6 +679,9 @@ where
 
                                 existing.extend(changed_slots);
                             }
+                            self.metrics
+                                .state_override_update_duration
+                                .record(state_override_start.elapsed());
 
                             evm.db_mut().commit(state);
                         }
@@ -660,6 +695,10 @@ where
                         }
                     }
                 }
+
+                self.metrics
+                    .transaction_processing_duration
+                    .record(tx_process_start.elapsed());
             }
 
             pending_blocks_builder.with_flashblocks(block_flashblocks.into_iter());
@@ -667,6 +706,13 @@ where
             for (address, balance) in updated_balances {
                 pending_blocks_builder.with_account_balance(address, balance);
             }
+
+            self.metrics
+                .total_transactions_processed
+                .record(total_tx_count as f64);
+            self.metrics
+                .total_transactions_executed
+                .record(executed_tx_count as f64);
 
             last_block_header = block.header.clone();
         }
